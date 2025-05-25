@@ -1,0 +1,13 @@
+version: '3'
+services:
+  weibo-crawler:
+    build: .
+    container_name: weibo-crawler
+    environment:
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - schedule_interval=1
+    volumes:
+      - ./config.json:/app/config.json
+      - ./weibo:/app/weibo
+      - ./log:/app/log
+    restart: unless-stopped 

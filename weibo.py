@@ -13,10 +13,11 @@ import random
 import re
 import sqlite3
 import sys
+import threading
 import warnings
 import webbrowser
 from collections import OrderedDict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time
 from pathlib import Path
 from time import sleep
 
@@ -30,6 +31,10 @@ import const
 from util import csvutil
 from util.dateutil import convert_to_days_ago
 from util.notify import push_deer
+from util.llm_analyzer import LLMAnalyzer  # 导入 LLM 分析器
+
+# 全局变量
+weibo_id_list = []
 
 warnings.filterwarnings("ignore")
 
@@ -103,6 +108,18 @@ class Weibo(object):
         self.mongodb_URI = config.get("mongodb_URI")  # MongoDB数据库连接字符串，可以不填
         self.post_config = config.get("post_config")  # post_config，可以不填
         self.page_weibo_count = config.get("page_weibo_count")  # page_weibo_count，爬取一页的微博数，默认10页
+        
+        # 初始化 LLM 分析器
+        self.llm_analyzer = LLMAnalyzer(config) if config.get("llm_config") else None
+        
+        # 初始化企业微信机器人
+        webhook_url = config.get('webhook_url')
+        if webhook_url:
+            from wechat_bot import WeChatWorkBot
+            self.wechat_bot = WeChatWorkBot(webhook_url)
+        else:
+            self.wechat_bot = None
+        
         user_id_list = config["user_id_list"]
         self.session = requests.Session()
         adapter = HTTPAdapter(max_retries=5)
@@ -445,6 +462,11 @@ class Weibo(object):
             self.user_to_sqlite()
 
     def get_user_info(self):
+        user_info = OrderedDict()
+        user_info["id"] = self.user_config["user_id"]
+        user_info["screen_name"] = self.user_config["user_id"]
+        self.user = self.standardize_info(user_info)
+        return 0
         """获取用户信息"""
         params = {"containerid": "100505" + str(self.user_config["user_id"])}
         url = "https://m.weibo.cn/api/container/getIndex"
@@ -591,11 +613,25 @@ class Weibo(object):
                                 media_info.get("stream_url"))
         return video_url
 
-    def download_one_file(self, url, file_path, type, weibo_id):
+    def download_one_file(self, url, file_path, type, weibo_id, has_keyword):
         """下载单个文件(图片/视频)"""
         try:
-
+            # 修改文件路径到img目录
+            file_dir = os.path.split(os.path.realpath(__file__))[0] + os.sep + "weibo" + os.sep + "img"
+            if not os.path.isdir(file_dir):
+                os.makedirs(file_dir)
+            
+            # 获取原始文件名
+            original_filename = os.path.basename(file_path)
+            # 构建新的文件路径
+            file_path = os.path.join(file_dir, original_filename)
+            
             file_exist = os.path.isfile(file_path)
+            # 检查带'd_'前缀的文件是否存在
+            if not file_exist:
+                d_prefixed_path = os.path.join(file_dir, 'd_' + original_filename)
+                file_exist = os.path.isfile(d_prefixed_path)
+            
             need_download = (not file_exist)
             sqlite_exist = False
             if "sqlite" in self.write_mode:
@@ -664,11 +700,25 @@ class Weibo(object):
                     if detected_extension:
                         file_path = re.sub(r'\.\w+$', detected_extension, file_path)
 
+                    # 如果含有关键词，添加'd_'前缀
+                    if has_keyword:
+                        dir_name = os.path.dirname(file_path)
+                        file_name = os.path.basename(file_path)
+                        file_path = os.path.join(dir_name, 'd_' + file_name)
+
                     # 保存文件
                     if not os.path.isfile(file_path):
                         with open(file_path, "wb") as f:
                             f.write(downloaded)
                             logger.debug("[DEBUG] save " + file_path)
+
+                    # 如果含有关键词且是图片，发送到企业微信
+                    if has_keyword and detected_extension in ['.jpg', '.jpeg', '.png', '.gif']:
+                        try:
+                            if self.wechat_bot:
+                                self.wechat_bot.send_image(file_path, title=f"发现关键词图片 - 微博ID: {weibo_id}")
+                        except Exception as e:
+                            logger.error(f"发送图片到企业微信失败: {str(e)}")
 
                     success = True
                     logger.debug("[DEBUG] success " + url + "  " + str(try_count))
@@ -740,7 +790,7 @@ class Weibo(object):
         self.sqlite_insert(con, file_data, "bins")
         con.close()
 
-    def handle_download(self, file_type, file_dir, urls, w):
+    def handle_download(self, file_type, file_dir, urls, w, has_keyword):
         """处理下载相关操作"""
         file_prefix = w["created_at"][:11].replace("-", "") + "_" + str(w["id"])
         if file_type == "img":
@@ -754,7 +804,7 @@ class Weibo(object):
                         file_suffix = url[index:]
                     file_name = file_prefix + "_" + str(i + 1) + file_suffix
                     file_path = file_dir + os.sep + file_name
-                    self.download_one_file(url, file_path, file_type, w["id"])
+                    self.download_one_file(url, file_path, file_type, w["id"], has_keyword)
             else:
                 index = urls.rfind(".")
                 if len(urls) - index > 5:
@@ -763,7 +813,7 @@ class Weibo(object):
                     file_suffix = urls[index:]
                 file_name = file_prefix + file_suffix
                 file_path = file_dir + os.sep + file_name
-                self.download_one_file(urls, file_path, file_type, w["id"])
+                self.download_one_file(urls, file_path, file_type, w["id"],has_keyword)
         elif file_type == "video" or file_type == "live_photo":
             file_suffix = ".mp4"
             if ";" in urls:
@@ -773,13 +823,13 @@ class Weibo(object):
                         file_suffix = ".mov"
                     file_name = file_prefix + "_" + str(i + 1) + file_suffix
                     file_path = file_dir + os.sep + file_name
-                    self.download_one_file(url, file_path, file_type, w["id"])
+                    self.download_one_file(url, file_path, file_type, w["id"],has_keyword)
             else:
                 if urls.endswith(".mov"):
                     file_suffix = ".mov"
                 file_name = file_prefix + file_suffix
                 file_path = file_dir + os.sep + file_name
-                self.download_one_file(urls, file_path, file_type, w["id"])
+                self.download_one_file(urls, file_path, file_type, w["id"],has_keyword)
 
     def download_files(self, file_type, weibo_type, wrote_count):
         try:
@@ -828,7 +878,13 @@ class Weibo(object):
                         else:
                             continue
                     if w.get(key):
-                        self.handle_download(file_type, file_dir, w.get(key), w)
+                        key_words=["扫码","观影"]
+                        text = w.get('text', '')  # 提供默认空字符串
+                        has_keyword = False
+                        if text and any(keyword in text for keyword in key_words):
+                            has_keyword = True
+
+                        self.handle_download(file_type, file_dir, w.get(key), w, has_keyword)
                 
                 logger.info("%s下载完毕,保存路径:", describe)
                 logger.info(file_dir)
@@ -975,6 +1031,11 @@ class Weibo(object):
         weibo["reposts_count"] = self.string_to_int(weibo_info.get("reposts_count", 0))
         weibo["topics"] = self.get_topics(selector)
         weibo["at_users"] = self.get_at_users(selector)
+        
+        # 使用 LLM 分析微博内容
+        if self.llm_analyzer:
+            weibo = self.llm_analyzer.analyze_weibo(weibo)
+            logger.info("完整分析结果：\n%s", json.dumps(weibo, ensure_ascii=False, indent=2))
         return self.standardize_info(weibo)
 
     def print_user_info(self):
@@ -1323,7 +1384,8 @@ class Weibo(object):
                                 logger.info("cookie检查通过")
                                 if const.CHECK_COOKIE["EXIT_AFTER_CHECK"]:
                                     return True
-                            if wb["id"] in self.weibo_id_list:
+                            global weibo_id_list
+                            if wb["id"] in weibo_id_list:
                                 continue
                             created_at = datetime.strptime(wb["created_at"], DTFORMAT)
                             since_date = datetime.strptime(
@@ -1398,7 +1460,7 @@ class Weibo(object):
                                     return True
                             if (not self.only_crawl_original) or ("retweet" not in wb.keys()):
                                 self.weibo.append(wb)
-                                self.weibo_id_list.append(wb["id"])
+                                weibo_id_list.append(wb["id"])
                                 self.got_count += 1
                                 # 这里是系统日志输出，尽量别太杂
                                 logger.info(
@@ -1444,8 +1506,7 @@ class Weibo(object):
                 "https://github.com/dataabc/weibo-crawler#如何获取user_id\n"
                 "获取正确的user_id；\n"
                 "或者参考\n"
-                "https://github.com/dataabc/weibo-crawler#3程序设置\n"
-                "中的“设置cookie”部分设置cookie信息"
+            
             )
 
     def get_write_info(self, wrote_count):
@@ -2162,7 +2223,7 @@ class Weibo(object):
             since_date = datetime.strptime(self.user_config["since_date"], DTFORMAT)
             today = datetime.today()
             if since_date <= today:    # since_date 若为未来则无需执行
-                page_count = self.get_page_count()
+                page_count = 1
                 wrote_count = 0
                 page1 = 0
                 random_pages = random.randint(1, 5)
@@ -2170,22 +2231,18 @@ class Weibo(object):
                 pages = range(self.start_page, page_count + 1)
                 for page in tqdm(pages, desc="Progress"):
                     is_end = self.get_one_page(page)
-                    if is_end:
-                        break
 
-                    if page % 20 == 0:  # 每爬20页写入一次文件
-                        self.write_data(wrote_count)
-                        wrote_count = self.got_count
+                    self.write_data(wrote_count)
+                    wrote_count = self.got_count
 
-                    # 通过加入随机等待避免被限制。爬虫速度过快容易被系统限制(一段时间后限
-                    # 制会自动解除)，加入随机等待模拟人的操作，可降低被系统限制的风险。默
-                    # 认是每爬取1到5页随机等待6到10秒，如果仍然被限，可适当增加sleep时间
-                    if (page - page1) % random_pages == 0 and page < page_count:
-                        sleep(random.randint(6, 10))
-                        page1 = page
-                        random_pages = random.randint(1, 5)
+                    # # 通过加入随机等待避免被限制。爬虫速度过快容易被系统限制(一段时间后限
+                    # # 制会自动解除)，加入随机等待模拟人的操作，可降低被系统限制的风险。默
+                    # # 认是每爬取1到5页随机等待6到10秒，如果仍然被限，可适当增加sleep时间
+                    # if (page - page1) % random_pages == 0 and page < page_count:
+                    #     sleep(random.randint(6, 10))
+                    #     page1 = page
+                    #     random_pages = random.randint(1, 5)
 
-                self.write_data(wrote_count)  # 将剩余不足20页的微博写入文件
             logger.info("微博爬取完成，共爬取%d条微博", self.got_count)
         except Exception as e:
             logger.exception(e)
@@ -2235,7 +2292,6 @@ class Weibo(object):
         self.user = {}
         self.user_config = user_config
         self.got_count = 0
-        self.weibo_id_list = []
 
     def start(self):
         """运行爬虫"""
@@ -2277,6 +2333,14 @@ def get_config():
             # 重命名一些key, 但向前兼容
             handle_config_renaming(config, oldName="filter", newName="only_crawl_original")
             handle_config_renaming(config, oldName="result_dir_name", newName="user_id_as_folder_name")
+            
+            # 从环境变量中获取配置
+            if "webhook_url" in config and config["webhook_url"].startswith("${") and config["webhook_url"].endswith("}"):
+                env_var = config["webhook_url"][2:-1]  # 移除 ${ 和 }
+                config["webhook_url"] = os.getenv(env_var)
+                if not config["webhook_url"]:
+                    logger.warning(f"环境变量 {env_var} 未设置，webhook_url 将为空")
+            
             return config
     except ValueError:
         logger.error(
@@ -2286,16 +2350,21 @@ def get_config():
 
 
 def main():
-    try:
-        config = get_config()
-        wb = Weibo(config)
-        wb.start()  # 爬取微博信息
-        if const.NOTIFY["NOTIFY"]:
-            push_deer("更新了一次微博")
-    except Exception as e:
-        if const.NOTIFY["NOTIFY"]:
-            push_deer("weibo-crawler运行出错，错误为{}".format(e))
-        logger.exception(e)
+    while True:
+        try:
+            config = get_config()
+            wb = Weibo(config)
+            wb.start()  # 爬取微博信息
+            if const.NOTIFY["NOTIFY"]:
+                push_deer("更新了一次微博")
+        except Exception as e:
+            if const.NOTIFY["NOTIFY"]:
+                push_deer("weibo-crawler运行出错，错误为{}".format(e))
+            logger.exception(e)
+        
+      
+        # 随机等待0.5-1.5秒
+        threading.Event().wait(random.uniform(0.5, 1.5))
 
 
 if __name__ == "__main__":

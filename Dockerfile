@@ -15,6 +15,8 @@ COPY . .
 
 # 设置循环间隔
 ENV schedule_interval=1
+# 设置环境变量
+ENV WEBHOOK_URL=""
 
 # 运行应用
 CMD python __main__.py $schedule_interval
